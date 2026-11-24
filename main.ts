@@ -14,6 +14,11 @@
 //  - At most 5 open positions, at most ~1.3 SOL deployed, drawdown brake at
 //    40% of peak equity. Deterministic: every decision is a pure function of
 //    the batch stream — no wall clock, no randomness, no network, no env reads.
+//
+// Harness fact that shapes this code: a batch's marks[] covers ONLY mints
+// the bot already holds (plus pending orders) — a new coin never has a
+// mark. Entries therefore read prices and reserves from the events
+// themselves; marks are used only to value open positions.
 
 import { createInterface } from "node:readline";
 
@@ -60,6 +65,12 @@ interface CoinState {
   peak: number;
   signalSlot: number;
   signalPrice: number;
+  // Latest reserves/price, from events or marks. Marks are only ever sent
+  // for mints the bot already holds, so entries MUST use this event-derived
+  // state — a new coin never has a mark.
+  lastVsol: bigint;
+  lastRsol: bigint;
+  lastPrice: number;
 }
 
 interface MyPosition {
@@ -98,6 +109,9 @@ function coinFor(mint: string): CoinState {
       peak: 0,
       signalSlot: -1,
       signalPrice: 0,
+      lastVsol: 0n,
+      lastRsol: 0n,
+      lastPrice: 0,
     };
     coins.set(mint, c);
   }
@@ -195,10 +209,18 @@ function handleBatch(batch: any): any {
     if (ev.event === "CreateEvent") {
       c.seen = true;
       c.lastSlot = slot;
+      if (typeof ev.virtual_sol_reserves === "string") {
+        c.lastVsol = BigInt(ev.virtual_sol_reserves);
+        c.lastRsol = 0n;
+        c.lastPrice = priceOf(ev.virtual_sol_reserves, ev.virtual_token_reserves);
+      }
     } else if (ev.event === "TradeEvent") {
       const price = priceOf(ev.virtual_sol_reserves, ev.virtual_token_reserves);
       observePrice(c, slot, price);
       c.lastSlot = slot;
+      if (typeof ev.virtual_sol_reserves === "string") c.lastVsol = BigInt(ev.virtual_sol_reserves);
+      if (typeof ev.real_sol_reserves === "string") c.lastRsol = BigInt(ev.real_sol_reserves);
+      c.lastPrice = price;
       // Snipe signal: first trade with real reserves >= 1 SOL.
       if (c.signalSlot < 0 && typeof ev.real_sol_reserves === "string" && BigInt(ev.real_sol_reserves) >= SNIPE_RSOL_MIN) {
         c.signalSlot = slot;
@@ -221,6 +243,9 @@ function handleBatch(batch: any): any {
     const price = priceOf(m.virtual_quote_reserves, m.virtual_token_reserves);
     observePrice(c, slot, price);
     c.lastSlot = slot;
+    if (typeof m.virtual_quote_reserves === "string") c.lastVsol = BigInt(m.virtual_quote_reserves);
+    if (typeof m.real_quote_reserves === "string") c.lastRsol = BigInt(m.real_quote_reserves);
+    c.lastPrice = price;
     // Snipe signal from marks as well (a mint whose first seen state already
     // has real reserves >= 1 SOL).
     if (c.signalSlot < 0 && typeof m.real_quote_reserves === "string" && BigInt(m.real_quote_reserves) >= SNIPE_RSOL_MIN) {
@@ -244,7 +269,7 @@ function handleBatch(batch: any): any {
     const c = coins.get(p.mint);
     let price = 0;
     if (m !== undefined) price = priceOf(m.virtual_quote_reserves, m.virtual_token_reserves);
-    else if (c !== undefined && c.hist.length > 0) price = c.hist[c.hist.length - 1].price;
+    else if (c !== undefined) price = c.lastPrice;
     if (price > 0 && typeof p.token_amount === "string") {
       equitySol += (Number(BigInt(p.token_amount)) * price) / 1e9;
     }
@@ -292,7 +317,7 @@ function handleBatch(batch: any): any {
       price = priceOf(m.virtual_quote_reserves, m.virtual_token_reserves);
     } else {
       const c = coins.get(p.mint);
-      if (c !== undefined && c.hist.length > 0) price = c.hist[c.hist.length - 1].price;
+      if (c !== undefined) price = c.lastPrice;
     }
     if (price <= 0) continue;
     const entry = Number(cost) / Number(tokens);
@@ -332,11 +357,10 @@ function handleBatch(batch: any): any {
     const c = coins.get(mint);
     if (c === undefined || !c.seen || c.completed) continue;
     if (myPositions.has(mint) || bought.has(mint)) continue;
-    const m = markByMint.get(mint);
-    if (m === undefined) continue;
-    const vsol = BigInt(m.virtual_quote_reserves);
-    const rsol = BigInt(m.real_quote_reserves);
-    const price = priceOf(m.virtual_quote_reserves, m.virtual_token_reserves);
+    // Entry state comes from the events (a new coin never has a mark).
+    const vsol = c.lastVsol;
+    const rsol = c.lastRsol;
+    const price = c.lastPrice;
     if (price <= 0) continue;
 
     // Deep-curve dip sleeve.
@@ -408,12 +432,12 @@ function handleBatch(batch: any): any {
       const cost = BigInt(p.cost_lamports);
       if (cost >= SNIPE_TARGET) continue;
       const c = coins.get(p.mint);
-      const m = markByMint.get(p.mint);
-      if (c === undefined || m === undefined) continue;
+      if (c === undefined) continue;
       if (c.signalSlot < 0 || slot - c.signalSlot > 600) continue;
-      const price = priceOf(m.virtual_quote_reserves, m.virtual_token_reserves);
+      const m = markByMint.get(p.mint);
+      const price = m !== undefined ? priceOf(m.virtual_quote_reserves, m.virtual_token_reserves) : c.lastPrice;
       if (price <= 0 || price > c.signalPrice * SNIPE_MAX_CHASE) continue;
-      const rsol = BigInt(m.real_quote_reserves);
+      const rsol = m !== undefined ? BigInt(m.real_quote_reserves) : c.lastRsol;
       const cap = (rsol * BigInt(maxOrderBps)) / 10000n;
       let chunk = SNIPE_TARGET - cost;
       if (chunk > cap) chunk = cap;
